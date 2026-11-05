@@ -33,6 +33,9 @@ from torchvision import transforms
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
+# Keep CPU thread usage modest on small free instances.
+torch.set_num_threads(1)
+
 # ----------------------------- CONFIG ---------------------------------------
 # Public Hugging Face model repository. Set this in Render's Environment.
 # Example: YOUR_USERNAME/disaster-classifier
@@ -88,12 +91,42 @@ async def lifespan(app: FastAPI):
         revision=HF_MODEL_REVISION,
         token=os.getenv("HF_TOKEN") or None,  # not required for a public repo
     )
-    ckpt = torch.load(ckpt_path, map_location=device)
+    # Memory-conscious loading:
+    # - mmap=True maps checkpoint tensors from disk instead of eagerly copying
+    #   the entire 104 MB checkpoint into RAM.
+    # - assign=True attaches checkpoint tensors to the model rather than
+    #   copying them into a second set of parameter tensors.
+    # This requires a recent PyTorch version and a checkpoint saved with the
+    # standard zip-based torch.save format.
+    try:
+        ckpt = torch.load(
+            ckpt_path,
+            map_location="cpu",
+            mmap=True,
+            weights_only=True,
+        )
+        use_assign = True
+    except (TypeError, RuntimeError):
+        # Compatibility fallback for older PyTorch/checkpoint formats.
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        use_assign = False
+
     classes = ckpt["classes"]
     img_size = ckpt["img_size"]
+    model_name = ckpt["model_name"]
 
-    model = DisasterClassifier(ckpt["model_name"], len(classes)).to(device)
-    model.load_state_dict(ckpt["model"])
+    model = DisasterClassifier(model_name, len(classes))
+    if use_assign:
+        model.load_state_dict(ckpt["model"], assign=True)
+    else:
+        model.load_state_dict(ckpt["model"])
+
+    # Release checkpoint dictionary references as soon as weights are attached.
+    del ckpt
+    import gc
+    gc.collect()
+
+    model = model.to(device)
     model.eval()
 
     STATE["device"] = device
@@ -108,7 +141,7 @@ async def lifespan(app: FastAPI):
         ]
     )
     print(
-        f"Model loaded: {ckpt['model_name']} | classes: {classes} "
+        f"Model loaded: {model_name} | classes: {classes} "
         f"| device: {device} | checkpoint: {ckpt_path}"
     )
     yield
@@ -152,7 +185,7 @@ def predict(
         raise HTTPException(400, "Could not read this file as an image.") from None
 
     x = STATE["tf"](img).unsqueeze(0).to(STATE["device"])
-    with torch.no_grad():
+    with torch.inference_mode():
         probs = torch.softmax(STATE["model"](x), dim=1)[0].cpu()
 
     classes = STATE["classes"]
